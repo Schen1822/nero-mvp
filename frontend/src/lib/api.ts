@@ -61,7 +61,7 @@ export const api = {
     }),
 
   nextSong: (code: string, participantId: string) =>
-    req<{ song?: import("../types").Song; ended?: boolean; party?: import("../types").Party; startedAt?: number }>(`/parties/${code}/next`, {
+    req<{ song?: import("../types").Song; empty?: boolean; party?: import("../types").Party; startedAt?: number }>(`/parties/${code}/next`, {
       method: "POST",
       body: JSON.stringify({ participantId }),
     }),

@@ -13,12 +13,18 @@ const prisma = new PrismaClient();
 
 const io = new Server(server, {
   cors: {
-    origin: "http://localhost:5173",
+    origin: (origin, callback) => {
+      if (!origin || /^http:\/\/localhost(:\d+)?$/.test(origin)) {
+        callback(null, true);
+      } else {
+        callback(new Error("Not allowed by CORS"));
+      }
+    },
     methods: ["GET", "POST", "PUT", "DELETE"],
   },
 });
 
-app.use(cors());
+app.use(cors({ origin: /^http:\/\/localhost:\d+$/ }));
 app.use(express.json());
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -49,6 +55,23 @@ function sanitizeParty(party: Awaited<ReturnType<typeof getPartyWithData>>) {
   return { ...rest, hasPassword: passwordHash !== null };
 }
 
+type PartyWithData = NonNullable<Awaited<ReturnType<typeof getPartyWithData>>>;
+
+// Emit directly to every connected participant's socket ID — bypasses room membership.
+function emitToParty(party: PartyWithData, event: string, data: unknown) {
+  party.participants
+    .filter((p) => p.socketId)
+    .forEach((p) => io.to(p.socketId!).emit(event, data));
+}
+
+async function emitPartySync(partyCode: string) {
+  const party = await getPartyWithData(partyCode);
+  if (!party) return null;
+  const sanitized = sanitizeParty(party);
+  emitToParty(party, "party:sync", { party: sanitized });
+  return { party, sanitized };
+}
+
 // ─── Auth helpers ─────────────────────────────────────────────────────────────
 
 interface AuthRequest extends Request {
@@ -57,7 +80,7 @@ interface AuthRequest extends Request {
   params: Record<string, string>;
 }
 
-function requireAuth(req: AuthRequest, res: Response, next: NextFunction) {
+async function requireAuth(req: AuthRequest, res: Response, next: NextFunction) {
   const header = req.headers.authorization;
   if (!header?.startsWith("Bearer ")) {
     res.status(401).json({ error: "Unauthorized" });
@@ -68,6 +91,11 @@ function requireAuth(req: AuthRequest, res: Response, next: NextFunction) {
       userId: string;
       username: string;
     };
+    const user = await prisma.user.findUnique({ where: { id: payload.userId } });
+    if (!user) {
+      res.status(401).json({ error: "Session expired, please log in again" });
+      return;
+    }
     req.userId = payload.userId;
     req.username = payload.username;
     next();
@@ -209,6 +237,9 @@ app.post("/parties/:code/join", requireAuth, async (req: AuthRequest, res) => {
       data: { partyId: party.id, name, emoji, isHost: false, userId: req.userId },
     });
 
+    // Notify everyone already in the room that a new participant joined
+    await emitPartySync(req.params.code);
+
     res.json({ participant });
   } catch {
     res.status(500).json({ error: "Failed to join party" });
@@ -226,10 +257,9 @@ app.post("/parties/:code/start", async (req, res) => {
     const me = party.participants.find((p) => p.id === participantId);
     if (!me?.isHost)
       return res.status(403).json({ error: "Only host can start" });
-    if (party.songs.length === 0)
+    const firstSong = party.songs.find((s) => s.status === "queued");
+    if (!firstSong)
       return res.status(400).json({ error: "Add songs first" });
-
-    const firstSong = party.songs[0];
     const now = new Date();
 
     await prisma.$transaction([
@@ -244,12 +274,12 @@ app.post("/parties/:code/start", async (req, res) => {
     ]);
 
     const fullParty = await getPartyWithData(req.params.code);
-
-    io.to(req.params.code).emit("party:started", {
-      party: sanitizeParty(fullParty),
-      startedAt: now.getTime(),
-    });
-
+    if (fullParty) {
+      emitToParty(fullParty, "party:started", {
+        party: sanitizeParty(fullParty),
+        startedAt: now.getTime(),
+      });
+    }
     res.json({ party: sanitizeParty(fullParty), startedAt: now.getTime() });
   } catch (err) {
     console.error(err);
@@ -295,7 +325,7 @@ app.post("/parties/:code/songs", async (req, res) => {
       include: { votes: true },
     });
 
-    io.to(req.params.code).emit("song:added", { song });
+    await emitPartySync(req.params.code);
     res.json({ song });
   } catch (err) {
     console.error(err);
@@ -332,7 +362,7 @@ app.post("/parties/:code/songs/:songId/vote", async (req, res) => {
       include: { votes: true },
     });
 
-    io.to(req.params.code).emit("song:voted", { song });
+    await emitPartySync(req.params.code);
     res.json({ song });
   } catch (err) {
     console.error(err);
@@ -366,7 +396,7 @@ app.post("/parties/:code/next", async (req, res) => {
 
     if (!nextSong) {
       const idleParty = await getPartyWithData(req.params.code);
-      io.to(req.params.code).emit("queue:empty", { party: sanitizeParty(idleParty) });
+      if (idleParty) emitToParty(idleParty, "queue:empty", { party: sanitizeParty(idleParty) });
       return res.json({ empty: true, party: sanitizeParty(idleParty) });
     }
 
@@ -381,11 +411,13 @@ app.post("/parties/:code/next", async (req, res) => {
     });
 
     const fullParty = await getPartyWithData(req.params.code);
-    io.to(req.params.code).emit("song:changed", {
-      song: { ...nextSong, status: "playing" },
-      party: sanitizeParty(fullParty),
-      startedAt: now.getTime(),
-    });
+    if (fullParty) {
+      emitToParty(fullParty, "song:changed", {
+        song: { ...nextSong, status: "playing" },
+        party: sanitizeParty(fullParty),
+        startedAt: now.getTime(),
+      });
+    }
 
     res.json({ song: nextSong, startedAt: now.getTime() });
   } catch (err) {
@@ -416,7 +448,7 @@ app.post("/parties/:code/end", async (req, res) => {
     });
 
     const finalParty = await getPartyWithData(req.params.code);
-    io.to(req.params.code).emit("party:ended", { party: sanitizeParty(finalParty) });
+    if (finalParty) emitToParty(finalParty, "party:ended", { party: sanitizeParty(finalParty) });
     res.json({ party: sanitizeParty(finalParty) });
   } catch (err) {
     console.error(err);
@@ -457,7 +489,7 @@ app.put("/parties/:code/songs/:songId/position", async (req, res) => {
     ]);
 
     const updated = await getPartyWithData(req.params.code);
-    io.to(req.params.code).emit("party:sync", { party: sanitizeParty(updated) });
+    if (updated) emitToParty(updated, "party:sync", { party: sanitizeParty(updated) });
     res.json({ party: sanitizeParty(updated) });
   } catch (err) {
     console.error(err);
@@ -514,18 +546,12 @@ io.on("connection", (socket) => {
       .update({ where: { id: participantId }, data: { socketId: socket.id } })
       .catch(() => {});
 
-    const party = await getPartyWithData(partyCode);
-    if (party) {
-      const participant = party.participants.find((p) => p.id === participantId);
-      if (participant) {
-        socket.to(partyCode).emit("participant:joined", { participant });
-      }
-      socket.emit("party:sync", { party: sanitizeParty(party) });
-    }
+    await emitPartySync(partyCode);
   });
 
-  socket.on("reaction", ({ partyCode, emoji }) => {
-    io.to(partyCode).emit("reaction:float", { emoji, id: socket.id });
+  socket.on("reaction", async ({ partyCode, emoji }) => {
+    const party = await getPartyWithData(partyCode);
+    if (party) emitToParty(party, "reaction:float", { emoji, id: socket.id });
   });
 
   socket.on("song:reveal-request", async ({ partyCode }: { partyCode: string }) => {
@@ -533,7 +559,7 @@ io.on("connection", (socket) => {
     if (!party) return;
     const current = party.songs.find((s) => s.status === "playing");
     if (!current) return;
-    io.to(partyCode).emit("song:reveal", {
+    emitToParty(party, "song:reveal", {
       song: current,
       participants: party.participants,
     });
@@ -543,7 +569,9 @@ io.on("connection", (socket) => {
     if (!text?.trim()) return;
     const participant = await prisma.participant.findUnique({ where: { id: participantId } }).catch(() => null);
     if (!participant) return;
-    io.to(partyCode).emit("chat:message", {
+    const party = await getPartyWithData(partyCode);
+    if (!party) return;
+    emitToParty(party, "chat:message", {
       id: `${socket.id}-${Date.now()}`,
       participantId,
       name: participant.name,
@@ -565,14 +593,13 @@ io.on("connection", (socket) => {
         .update({ where: { id: participant.id }, data: { socketId: null } })
         .catch(() => {});
 
-      const party = await prisma.party
-        .findUnique({ where: { id: participant.partyId } })
+      const fullParty = await prisma.party.findUnique({ where: { id: participant.partyId } })
         .catch(() => null);
-
-      if (party) {
-        io.to(party.code).emit("participant:left", {
-          participantId: participant.id,
-        });
+      if (fullParty) {
+        const partyWithData = await getPartyWithData(fullParty.code);
+        if (partyWithData) {
+          emitToParty(partyWithData, "party:sync", { party: sanitizeParty(partyWithData) });
+        }
       }
     }
   });

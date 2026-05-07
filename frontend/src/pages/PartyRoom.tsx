@@ -386,8 +386,6 @@ function SongRow({
   isCurrent: boolean;
   myVote: number | null;
   onVote: (songId: string, value: 1 | 2 | 3 | 4 | 5) => void;
-  partyCode: string;
-  participantId: string;
   participants: import("../types").Participant[];
   isHost?: boolean;
   isFirst?: boolean;
@@ -633,6 +631,8 @@ export default function PartyRoom() {
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const progressRef = useRef<ReturnType<typeof setInterval>>();
   const isHostRef = useRef(false);
+  const currentSongIdRef = useRef<string | null>(null);
+  const revealTimeoutRef = useRef<ReturnType<typeof setTimeout>>();
   const participantId = localStorage.getItem(`party:${code}:pid`) || "";
 
   const isHost = party?.participants.find((p) => p.id === participantId)?.isHost ?? false;
@@ -658,6 +658,7 @@ export default function PartyRoom() {
       audioRef.current.pause();
       audioRef.current.src = "";
     }
+    currentSongIdRef.current = song.id;
     const audio = new Audio(song.previewUrl);
     audio.currentTime = Math.min(offsetMs / 1000, 28);
     audioRef.current = audio;
@@ -699,14 +700,19 @@ export default function PartyRoom() {
       return;
     }
 
+    function emitJoin() {
+      socket.emit("party:join", { partyCode: code, participantId });
+    }
+
+    socket.on("connect", emitJoin);
     socket.connect();
-    socket.emit("party:join", { partyCode: code, participantId });
 
     socket.on("party:sync", ({ party: p }: { party: Party }) => {
       setParty(p);
       if (p.status === "playing") {
         const playing = p.songs.find((s) => s.status === "playing");
-        if (playing?.startedAt) {
+        // Only restart audio if the playing song actually changed
+        if (playing?.startedAt && playing.id !== currentSongIdRef.current) {
           const offset = Date.now() - new Date(playing.startedAt).getTime();
           playSong(playing, offset);
         }
@@ -730,42 +736,12 @@ export default function PartyRoom() {
       playSong(song, offset);
     });
 
-    socket.on("song:added", ({ song }: { song: Song }) => {
-      setParty((prev) => {
-        if (!prev) return prev;
-        const exists = prev.songs.find((s) => s.id === song.id);
-        if (exists) return prev;
-        return { ...prev, songs: [...prev.songs, song] };
-      });
-    });
-
     socket.on("song:voted", ({ song }: { song: Song }) => {
       setParty((prev) => {
         if (!prev) return prev;
         return {
           ...prev,
           songs: prev.songs.map((s) => (s.id === song.id ? song : s)),
-        };
-      });
-    });
-
-    socket.on("participant:joined", ({ participant }) => {
-      setParty((prev) => {
-        if (!prev) return prev;
-        const exists = prev.participants.find((p) => p.id === participant.id);
-        if (exists) return prev;
-        return { ...prev, participants: [...prev.participants, participant] };
-      });
-    });
-
-    socket.on("participant:left", ({ participantId: pid }) => {
-      setParty((prev) => {
-        if (!prev) return prev;
-        return {
-          ...prev,
-          participants: prev.participants.map((p) =>
-            p.id === pid ? { ...p, socketId: null } : p
-          ),
         };
       });
     });
@@ -792,7 +768,8 @@ export default function PartyRoom() {
 
     socket.on("song:reveal", ({ song, participants }: { song: Song; participants: import("../types").Participant[] }) => {
       setReveal({ song, participants });
-      setTimeout(() => setReveal(null), REVEAL_DURATION + 500);
+      clearTimeout(revealTimeoutRef.current);
+      revealTimeoutRef.current = setTimeout(() => setReveal(null), REVEAL_DURATION + 500);
     });
 
     socket.on("chat:message", (msg: ChatMessage) => {
@@ -821,13 +798,11 @@ export default function PartyRoom() {
       .finally(() => setLoading(false));
 
     return () => {
+      socket.off("connect", emitJoin);
       socket.off("party:sync");
       socket.off("party:started");
       socket.off("song:changed");
-      socket.off("song:added");
       socket.off("song:voted");
-      socket.off("participant:joined");
-      socket.off("participant:left");
       socket.off("queue:empty");
       socket.off("party:ended");
       socket.off("song:reveal");
@@ -836,6 +811,7 @@ export default function PartyRoom() {
       socket.disconnect();
       audioRef.current?.pause();
       clearInterval(progressRef.current);
+      clearTimeout(revealTimeoutRef.current);
     };
   }, [code]); // eslint-disable-line
 
@@ -1166,8 +1142,6 @@ export default function PartyRoom() {
                 isCurrent={false}
                 myVote={myVoteFor(song.id)}
                 onVote={handleVote}
-                partyCode={code!}
-                participantId={participantId}
                 participants={party.participants}
               />
             ))}
@@ -1178,8 +1152,6 @@ export default function PartyRoom() {
                 isCurrent
                 myVote={myVoteFor(currentSong.id)}
                 onVote={handleVote}
-                partyCode={code!}
-                participantId={participantId}
                 participants={party.participants}
               />
             )}
@@ -1190,8 +1162,6 @@ export default function PartyRoom() {
                 isCurrent={false}
                 myVote={myVoteFor(song.id)}
                 onVote={handleVote}
-                partyCode={code!}
-                participantId={participantId}
                 participants={party.participants}
                 isHost={isHost}
                 isFirst={idx === 0}
