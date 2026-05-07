@@ -7,4 +7,75 @@ datasource db {
   url      = "file:./dev.db"
 }
 
-// Design your schema here
+model Party {
+  id               String   @id @default(cuid())
+  code             String   @unique
+  name             String
+  passwordHash     String?
+  maxSongs         Int?
+  maxMinutes       Int?
+  status           String   @default("lobby")
+  currentSongIndex Int      @default(-1)
+  createdAt        DateTime @default(now())
+
+  participants Participant[]
+  songs        Song[]
+}
+
+model User {
+  id           String   @id @default(cuid())
+  username     String   @unique
+  email        String   @unique
+  passwordHash String
+  createdAt    DateTime @default(now())
+
+  participants Participant[]
+}
+
+model Participant {
+  id       String   @id @default(cuid())
+  partyId  String
+  userId   String?
+  name     String
+  emoji    String
+  isHost   Boolean  @default(false)
+  socketId String?
+  joinedAt DateTime @default(now())
+
+  user  User?  @relation(fields: [userId], references: [id])
+  party Party  @relation(fields: [partyId], references: [id])
+  votes Vote[]
+}
+
+model Song {
+  id         String    @id @default(cuid())
+  partyId    String
+  deezerId   String
+  title      String
+  artist     String
+  album      String?
+  coverUrl   String?
+  previewUrl String?
+  addedById  String
+  position   Int
+  status     String    @default("queued")
+  playedAt   DateTime?
+  startedAt  DateTime?
+  createdAt  DateTime  @default(now())
+
+  party Party  @relation(fields: [partyId], references: [id])
+  votes Vote[]
+}
+
+model Vote {
+  id            String   @id @default(cuid())
+  songId        String
+  participantId String
+  value         Int
+  createdAt     DateTime @default(now())
+
+  song        Song        @relation(fields: [songId], references: [id])
+  participant Participant @relation(fields: [participantId], references: [id])
+
+  @@unique([songId, participantId])
+}

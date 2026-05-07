@@ -1,11 +1,49 @@
+import { BrowserRouter, Routes, Route, Navigate, useLocation } from "react-router-dom";
+import { AuthProvider, useAuth } from "./contexts/AuthContext";
+import Landing from "./pages/Landing";
+import PartyRoom from "./pages/PartyRoom";
+import Login from "./pages/Login";
+
+function RequireAuth({ children }: { children: React.ReactNode }) {
+  const { user, loading } = useAuth();
+  const location = useLocation();
+
+  if (loading) return null; // wait for token verification
+  if (!user) return <Navigate to="/login" state={{ from: location.pathname }} replace />;
+  return <>{children}</>;
+}
+
+function AppRoutes() {
+  return (
+    <Routes>
+      <Route path="/login" element={<Login />} />
+      <Route
+        path="/"
+        element={
+          <RequireAuth>
+            <Landing />
+          </RequireAuth>
+        }
+      />
+      <Route
+        path="/party/:code"
+        element={
+          <RequireAuth>
+            <PartyRoom />
+          </RequireAuth>
+        }
+      />
+    </Routes>
+  );
+}
+
 function App() {
   return (
-    <div className="min-h-screen bg-gray-100">
-      <div className="container mx-auto px-4 py-8">
-        <h1 className="text-3xl font-bold text-gray-900">Nero Party</h1>
-        <p className="mt-2 text-gray-600">Start building here.</p>
-      </div>
-    </div>
+    <BrowserRouter>
+      <AuthProvider>
+        <AppRoutes />
+      </AuthProvider>
+    </BrowserRouter>
   );
 }
 
